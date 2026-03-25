@@ -51,28 +51,56 @@ def main():
         datastore = client.datastores.create(name=ds_name)
         datastore_id = datastore.id
 
-        # Step 2: Upload product data as a document
-        print(f"   📄 Uploading product data to datastore...")
-        with open(args.data, "rb") as doc_file:
+        # Step 2: Convert JSON to HTML and upload (Contextual AI requires HTML/PDF)
+        print(f"   📄 Converting product data to HTML and uploading...")
+        import tempfile
+
+        with open(args.data) as jf:
+            product_data = json.load(jf)
+
+        html = "<html><head><title>Product Data</title></head><body>\n"
+        html += f"<h1>Products from {product_data.get('store_url', 'Unknown')}</h1>\n"
+        html += f"<p>Scraped: {product_data.get('scraped_at', '')}, Count: {product_data.get('product_count', 0)}</p>\n"
+        html += "<table border='1'><tr><th>Title</th><th>Price</th><th>Compare At</th><th>Type</th><th>Vendor</th><th>Available</th></tr>\n"
+        for p in product_data.get("products", [])[:100]:  # Cap at 100 for fast ingestion
+            avail = "Yes"
+            if p.get("variants") and not p["variants"][0].get("available", True):
+                avail = "No"
+            html += f"<tr><td>{p.get('title','')}</td><td>${p.get('price','0')}</td>"
+            html += f"<td>{p.get('compare_at_price','') or ''}</td>"
+            html += f"<td>{p.get('product_type','')}</td><td>{p.get('vendor','')}</td>"
+            html += f"<td>{avail}</td></tr>\n"
+        html += "</table></body></html>"
+
+        html_path = tempfile.mktemp(suffix=".html")
+        with open(html_path, "w") as hf:
+            hf.write(html)
+
+        with open(html_path, "rb") as doc_file:
             client.datastores.documents.ingest(
                 datastore_id=datastore_id,
                 file=doc_file,
             )
+        os.unlink(html_path)
 
         # Step 3: Wait for ingestion (with timeout)
-        print("   ⏳ Waiting for document ingestion (max 60s)...")
+        print("   ⏳ Waiting for document ingestion (max 180s)...")
         start = time.time()
         ready = False
-        while time.time() - start < 60:
+        while time.time() - start < 180:
             try:
-                ds_info = client.datastores.metadata(datastore_id=datastore_id)
-                doc_count = getattr(ds_info, "document_count", 0)
-                if doc_count and doc_count > 0:
-                    ready = True
+                docs = client.datastores.documents.list(datastore_id=datastore_id)
+                for doc in docs.documents:
+                    status = getattr(doc, "status", "unknown")
+                    print(f"      Document status: {status}")
+                    if status == "completed":
+                        ready = True
+                        break
+                if ready:
                     break
             except Exception:
                 pass
-            time.sleep(5)
+            time.sleep(10)
 
         if not ready:
             print("   ⚠️  Ingestion still processing — using async grounding note")
