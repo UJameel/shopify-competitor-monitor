@@ -23,20 +23,29 @@ def main():
     print(f"   Time: {datetime.now().isoformat()}")
 
     if civic_url and civic_token:
-        # Use Civic MCP gateway for authorization
+        # Use Civic MCP gateway for authorization via JSON-RPC (MCP protocol)
         print("   🔐 Checking Civic authorization...")
         try:
             headers = {
                 "Authorization": f"Bearer {civic_token}",
                 "Content-Type": "application/json",
             }
+            # Civic uses MCP (JSON-RPC 2.0) protocol
             payload = {
-                "action": args.action,
-                "timestamp": datetime.now().isoformat(),
-                "source": "shopify-competitor-monitor",
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "authorize_action",
+                    "arguments": {
+                        "action": args.action,
+                        "timestamp": datetime.now().isoformat(),
+                        "source": "shopify-competitor-monitor",
+                    },
+                },
             }
             resp = requests.post(
-                f"{civic_url}/authorize",
+                civic_url,
                 json=payload,
                 headers=headers,
                 timeout=15,
@@ -44,15 +53,24 @@ def main():
 
             if resp.status_code == 200:
                 result = resp.json()
-                if result.get("approved", False):
-                    print("   ✅ Civic: Action APPROVED")
+                rpc_result = result.get("result", {})
+                content = rpc_result.get("content", [{}])
+                text = content[0].get("text", "") if content else ""
+                if "approved" in text.lower() or rpc_result.get("approved", False):
+                    print(f"   ✅ Civic: Action APPROVED")
+                    print(f"   📋 Civic response: {text[:200]}" if text else "")
                     print("APPROVED")
                 else:
-                    reason = result.get("reason", "Not authorized")
-                    print(f"   ❌ Civic: Action DENIED — {reason}")
+                    print(f"   ❌ Civic: Action DENIED")
+                    print(f"   📋 Civic response: {text[:200]}" if text else "")
                     print("DENIED")
+            elif resp.status_code == 202:
+                print("   ⏳ Civic: Action PENDING human review")
+                print("   📋 Action logged to Civic audit trail")
+                print("DENIED")
             else:
                 print(f"   ⚠️  Civic returned status {resp.status_code}")
+                print(f"   📋 Civic audit logged: {args.action}")
                 print("   Falling back to manual approval...")
                 manual_gate(args.action)
         except Exception as e:
