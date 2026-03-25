@@ -1,0 +1,10 @@
+{
+  "stores": [
+    "https://www.gymshark.com",
+    "https://www.alphaleteathletics.com",
+    "https://www.youngla.com"
+  ],
+  "scan_interval_hours": 24,
+  "alert_on": ["price_decrease", "new_product", "out_of_stock"],
+  "alert_threshold_percent": 10
+}
