@@ -12,6 +12,16 @@ from urllib.parse import urlparse
 
 import requests
 
+# Browser-like headers to bypass basic 403 blocks
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
+}
+
 
 def get_store_name(url):
     """Extract a clean store name from URL."""
@@ -28,12 +38,19 @@ def scrape_shopify_direct(store_url):
 
     print(f"🔍 Scraping {base}/products.json ...")
 
+    session = requests.Session()
+    session.headers.update(BROWSER_HEADERS)
+
+    # First visit the homepage to get cookies (bypass some bot detection)
+    try:
+        session.get(base, timeout=15)
+    except Exception:
+        pass
+
     while True:
         url = f"{base}/products.json?limit=250&page={page}"
         try:
-            resp = requests.get(url, timeout=30, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; ShopifyMonitor/1.0)"
-            })
+            resp = session.get(url, timeout=30)
             resp.raise_for_status()
         except requests.RequestException as e:
             if page == 1:
@@ -57,36 +74,67 @@ def scrape_shopify_direct(store_url):
 
 
 def scrape_via_apify(store_url, api_token):
-    """Fall back to Apify actor for non-Shopify stores."""
-    print(f"🔄 Direct endpoint failed. Falling back to Apify scraper...")
-
-    actor_id = "dainty_screw~shopify-products-scraper"
-    run_url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
+    """Fall back to Apify web scraper for any store."""
+    print(f"🔄 Falling back to Apify web scraper...")
 
     headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}
-    payload = {"startUrls": [{"url": store_url}], "maxProducts": 500}
 
-    # Start the actor run
-    resp = requests.post(run_url, json=payload, headers=headers, timeout=30)
-    resp.raise_for_status()
+    # Try multiple Shopify scraper actors in order of reliability
+    actors = [
+        ("logie~shopify-products-scraper", {
+            "startUrls": [{"url": store_url}],
+            "maxProducts": 500,
+            "proxyConfiguration": {"useApifyProxy": True},
+        }),
+        ("autofacts~shopify", {
+            "startUrls": [{"url": store_url}],
+            "maxProducts": 500,
+        }),
+        ("pocesar~shopify-scraper", {
+            "startUrls": [{"url": store_url}],
+        }),
+    ]
+
+    resp = None
+    for actor_id, payload in actors:
+        print(f"   🛒 Trying actor: {actor_id}...")
+        run_url = f"https://api.apify.com/v2/acts/{actor_id}/runs"
+        try:
+            resp = requests.post(run_url, json=payload, headers=headers, timeout=30)
+            if resp.status_code in (200, 201):
+                print(f"   ✅ Actor {actor_id} started successfully")
+                break
+            print(f"   ⚠️  Actor {actor_id} returned {resp.status_code}")
+        except Exception as e:
+            print(f"   ⚠️  Actor {actor_id} failed: {e}")
+            resp = None
+            continue
+
+    if not resp or resp.status_code not in (200, 201):
+        raise RuntimeError("All Apify actors failed to start")
+
     run_data = resp.json()["data"]
     run_id = run_data["id"]
     dataset_id = run_data["defaultDatasetId"]
 
     print(f"   🚀 Apify run started: {run_id}")
 
-    # Poll until finished (max 120s)
+    # Poll until finished (max 180s)
     status_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
-    for _ in range(24):
+    for _ in range(36):
         time.sleep(5)
-        status = requests.get(status_url, headers=headers, timeout=15).json()["data"]["status"]
+        try:
+            status_resp = requests.get(status_url, headers=headers, timeout=15).json()
+            status = status_resp["data"]["status"]
+        except Exception:
+            continue
         if status == "SUCCEEDED":
             break
         if status in ("FAILED", "ABORTED", "TIMED-OUT"):
             raise RuntimeError(f"Apify run {status}")
-        print(f"   ⏳ Apify run status: {status}")
+        print(f"   ⏳ Apify status: {status}")
     else:
-        raise RuntimeError("Apify run timed out after 120s")
+        raise RuntimeError("Apify run timed out after 180s")
 
     # Fetch results
     dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?format=json"
@@ -110,17 +158,26 @@ def normalize_product(product):
 
     images = [img.get("src", "") for img in product.get("images", [])]
 
+    # Handle Apify web scraper output format (flatter structure)
+    price = product.get("price", "0.00")
+    if variants:
+        price = variants[0]["price"]
+    elif isinstance(price, str) and price.replace(".", "").isdigit():
+        pass  # Already a price string
+    elif isinstance(price, (int, float)):
+        price = f"{price:.2f}"
+
     return {
-        "id": product.get("id"),
+        "id": product.get("id", hash(product.get("handle", product.get("title", "")))),
         "title": product.get("title", "Unknown"),
         "handle": product.get("handle", ""),
         "vendor": product.get("vendor", ""),
         "product_type": product.get("product_type", ""),
         "tags": product.get("tags", []) if isinstance(product.get("tags"), list)
-                else [t.strip() for t in product.get("tags", "").split(",") if t.strip()],
+                else [t.strip() for t in str(product.get("tags", "")).split(",") if t.strip()],
         "variants": variants,
-        "price": variants[0]["price"] if variants else "0.00",
-        "compare_at_price": variants[0]["compare_at_price"] if variants else None,
+        "price": price,
+        "compare_at_price": variants[0]["compare_at_price"] if variants else product.get("compare_at_price"),
         "images": images,
         "created_at": product.get("created_at", ""),
         "updated_at": product.get("updated_at", ""),
